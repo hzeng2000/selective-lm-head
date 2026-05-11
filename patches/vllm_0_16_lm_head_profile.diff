@@ -1,0 +1,306 @@
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -4,6 +4,7 @@
+ import functools
+ import gc
+ import itertools
++import json
+ import os
+ import threading
+ import time
+@@ -364,6 +365,16 @@
+         self.selective_lm_head_used = 0
+         self.selective_lm_head_fallback_large_k = 0
+         self.selective_lm_head_k_sum = 0
++        self.lm_head_profile_enabled = (
++            os.environ.get("VLLM_LM_HEAD_PROFILE", "0") == "1"
++        )
++        self.lm_head_profile_path = os.environ.get("VLLM_LM_HEAD_PROFILE_PATH")
++        self.lm_head_profile_log_every = int(
++            os.environ.get("VLLM_LM_HEAD_PROFILE_LOG_EVERY", "50")
++        )
++        self.lm_head_profile_step = 0
++        self.lm_head_profile_current: dict[str, Any] | None = None
++        self.lm_head_profile_active: dict[str, Any] | None = None
+ 
+         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
+             cache_config.cache_dtype, self.model_config
+@@ -3327,6 +3338,8 @@
+                 "State error: sample_tokens() must be called "
+                 "after execute_model() returns None."
+             )
++        lm_head_profile_step_start = self._lm_head_profile_tic()
++        lm_head_profile_record = None
+ 
+         if self.vllm_config.model_config.enable_return_routed_experts:
+             capturer = RoutedExpertsCapturer.get_instance()
+@@ -3387,6 +3400,11 @@
+             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
+             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
+             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens
++            lm_head_profile_record = self._lm_head_profile_start_step(
++                scheduler_output,
++                num_scheduled_tokens_np,
++                lm_head_profile_step_start,
++            )
+ 
+             logits_indices, spec_decode_metadata = self._prepare_inputs(
+                 scheduler_output,
+@@ -3528,6 +3546,7 @@
+ 
+         # Run the model.
+         # Use persistent buffers for CUDA graphs.
++        lm_head_profile_forward_start = self._lm_head_profile_tic()
+         with (
+             set_forward_context(
+                 attn_metadata,
+@@ -3550,6 +3569,9 @@
+                 inputs_embeds=inputs_embeds,
+                 **model_kwargs,
+             )
++        self._lm_head_profile_record_ms(
++            "forward_ms", lm_head_profile_forward_start
++        )
+ 
+         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+             if self.use_aux_hidden_state_outputs:
+@@ -3579,6 +3601,10 @@
+                     )
+ 
+                 sample_hidden_states = hidden_states[logits_indices]
++                if self.lm_head_profile_current is not None:
++                    self.lm_head_profile_current["sample_rows"] = int(
++                        sample_hidden_states.shape[0]
++                    )
+                 if (
+                     self.selective_lm_head_threshold > 0
+                     and self.parallel_config.tensor_parallel_size == 1
+@@ -3586,12 +3612,16 @@
+                 ):
+                     logits = None
+                 else:
+-                    logits = self.model.compute_logits(sample_hidden_states)
++                    logits = self._lm_head_profile_compute_logits(sample_hidden_states)
+             else:
+                 # Rare case.
+                 assert not self.is_pooling_model
+ 
+                 sample_hidden_states = hidden_states[logits_indices]
++                if self.lm_head_profile_current is not None:
++                    self.lm_head_profile_current["sample_rows"] = int(
++                        sample_hidden_states.shape[0]
++                    )
+                 if not get_pp_group().is_last_rank:
+                     all_gather_tensors = {
+                         "residual": not is_residual_scattered_for_sp(
+@@ -3605,7 +3635,7 @@
+                     )
+                     logits = None
+                 else:
+-                    logits = self.model.compute_logits(sample_hidden_states)
++                    logits = self._lm_head_profile_compute_logits(sample_hidden_states)
+ 
+                 model_output_broadcast_data: dict[str, Any] = {}
+                 if logits is not None:
+@@ -3630,6 +3660,7 @@
+             slot_mappings,
+         )
+         self.kv_connector_output = kv_connector_output
++        self.lm_head_profile_active = lm_head_profile_record
+         return None
+ 
+     @torch.inference_mode
+@@ -3670,6 +3701,7 @@
+         ) = self.execute_model_state
+         # Clear ephemeral state.
+         self.execute_model_state = None
++        self.lm_head_profile_current = self.lm_head_profile_active
+ 
+         selective_logits_used = False
+         if logits is None:
+@@ -3678,16 +3710,22 @@
+             )
+             selective_logits_used = logits is not None
+             if logits is None:
+-                logits = self.model.compute_logits(sample_hidden_states)
++                logits = self._lm_head_profile_compute_logits(sample_hidden_states)
+ 
+         # Apply structured output bitmasks if present.
+         if grammar_output is not None and not selective_logits_used:
++            lm_head_profile_grammar_start = self._lm_head_profile_tic()
+             apply_grammar_bitmask(
+                 scheduler_output, grammar_output, self.input_batch, logits
+             )
++            self._lm_head_profile_record_ms(
++                "grammar_ms", lm_head_profile_grammar_start
++            )
+ 
++        lm_head_profile_sample_start = self._lm_head_profile_tic()
+         with record_function_or_nullcontext("gpu_model_runner: sample"):
+             sampler_output = self._sample(logits, spec_decode_metadata)
++        self._lm_head_profile_record_ms("sample_ms", lm_head_profile_sample_start)
+ 
+         self._update_states_after_model_execute(
+             sampler_output.sampled_token_ids, scheduler_output
+@@ -3762,6 +3800,7 @@
+             else:
+                 propose_drafts_after_bookkeeping = input_fits_in_drafter
+ 
++        lm_head_profile_bookkeeping_start = self._lm_head_profile_tic()
+         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
+             (
+                 num_nans_in_logits,
+@@ -3779,6 +3818,9 @@
+                 scheduler_output.total_num_scheduled_tokens,
+                 spec_decode_metadata,
+             )
++        self._lm_head_profile_record_ms(
++            "bookkeeping_ms", lm_head_profile_bookkeeping_start
++        )
+ 
+         if propose_drafts_after_bookkeeping:
+             # ngram and other speculative decoding methods use the sampled
+@@ -3810,6 +3852,7 @@
+                 cudagraph_stats=cudagraph_stats,
+             )
+ 
++        self._lm_head_profile_finish_step()
+         if not self.use_async_scheduling:
+             return output
+ 
+@@ -3836,6 +3879,135 @@
+ 
+         return async_output
+ 
++    def _lm_head_profile_tic(self) -> float | None:
++        if not self.lm_head_profile_enabled:
++            return None
++        if torch.cuda.is_available() and self.device.type == "cuda":
++            torch.cuda.synchronize(self.device)
++        return time.perf_counter()
++
++    def _lm_head_profile_record_ms(
++        self, key: str, start_time: float | None
++    ) -> None:
++        if start_time is None or self.lm_head_profile_current is None:
++            return
++        if torch.cuda.is_available() and self.device.type == "cuda":
++            torch.cuda.synchronize(self.device)
++        elapsed_ms = (time.perf_counter() - start_time) * 1000.0
++        self.lm_head_profile_current[key] = (
++            self.lm_head_profile_current.get(key, 0.0) + elapsed_ms
++        )
++
++    def _lm_head_profile_start_step(
++        self,
++        scheduler_output: "SchedulerOutput",
++        num_scheduled_tokens_np: np.ndarray,
++        step_start_time: float | None,
++    ) -> dict[str, Any] | None:
++        if not self.lm_head_profile_enabled:
++            return None
++
++        scheduled_tokens = [int(x) for x in num_scheduled_tokens_np.tolist()]
++        num_decode_reqs = sum(1 for x in scheduled_tokens if x == 1)
++        num_prefill_reqs = len(scheduled_tokens) - num_decode_reqs
++        if num_prefill_reqs and num_decode_reqs:
++            phase = "mixed"
++        elif num_prefill_reqs:
++            phase = "prefill"
++        else:
++            phase = "decode"
++
++        self.lm_head_profile_step += 1
++        record: dict[str, Any] = {
++            "pid": os.getpid(),
++            "step": self.lm_head_profile_step,
++            "phase": phase,
++            "num_reqs": len(scheduled_tokens),
++            "num_scheduled_tokens": int(scheduler_output.total_num_scheduled_tokens),
++            "num_prefill_reqs": num_prefill_reqs,
++            "num_decode_reqs": num_decode_reqs,
++            "max_scheduled_tokens": max(scheduled_tokens) if scheduled_tokens else 0,
++            "sample_rows": 0,
++            "logits_rows": 0,
++            "forward_ms": 0.0,
++            "logits_ms": 0.0,
++            "grammar_ms": 0.0,
++            "sample_ms": 0.0,
++            "bookkeeping_ms": 0.0,
++            "step_ms": 0.0,
++            "_step_start_time": step_start_time,
++        }
++        self.lm_head_profile_current = record
++        return record
++
++    def _lm_head_profile_compute_logits(
++        self, hidden_states: torch.Tensor
++    ) -> torch.Tensor | None:
++        start_time = self._lm_head_profile_tic()
++        logits = self.model.compute_logits(hidden_states)
++        self._lm_head_profile_record_ms("logits_ms", start_time)
++        if self.lm_head_profile_current is not None:
++            self.lm_head_profile_current["logits_rows"] += int(hidden_states.shape[0])
++        return logits
++
++    def _lm_head_profile_finish_step(self) -> None:
++        if not self.lm_head_profile_enabled:
++            return
++        record = self.lm_head_profile_active or self.lm_head_profile_current
++        if record is None:
++            return
++        if not is_global_first_rank():
++            self.lm_head_profile_current = None
++            self.lm_head_profile_active = None
++            return
++
++        self.lm_head_profile_current = record
++        self._lm_head_profile_record_ms(
++            "step_ms", record.pop("_step_start_time", None)
++        )
++
++        forward_ms = float(record.get("forward_ms", 0.0))
++        logits_ms = float(record.get("logits_ms", 0.0))
++        grammar_ms = float(record.get("grammar_ms", 0.0))
++        sample_ms = float(record.get("sample_ms", 0.0))
++        bookkeeping_ms = float(record.get("bookkeeping_ms", 0.0))
++        core_ms = forward_ms + logits_ms + grammar_ms + sample_ms
++        model_logits_ms = forward_ms + logits_ms
++        runner_ms = core_ms + bookkeeping_ms
++        record["core_ms"] = core_ms
++        record["model_logits_ms"] = model_logits_ms
++        record["runner_accounted_ms"] = runner_ms
++        record["lm_head_share_model_logits"] = (
++            logits_ms / model_logits_ms if model_logits_ms > 0 else 0.0
++        )
++        record["lm_head_share_core"] = logits_ms / core_ms if core_ms > 0 else 0.0
++        record["lm_head_share_step"] = (
++            logits_ms / float(record["step_ms"])
++            if float(record["step_ms"]) > 0
++            else 0.0
++        )
++
++        if self.lm_head_profile_path:
++            parent_dir = os.path.dirname(self.lm_head_profile_path)
++            if parent_dir:
++                os.makedirs(parent_dir, exist_ok=True)
++            with open(self.lm_head_profile_path, "a", encoding="utf-8") as profile_f:
++                profile_f.write(json.dumps(record, sort_keys=True) + "\n")
++        elif self.lm_head_profile_step % self.lm_head_profile_log_every == 0:
++            logger.info(
++                "LM head profile step=%d phase=%s forward=%.3fms logits=%.3fms "
++                "sample=%.3fms lm_share_core=%.3f",
++                record["step"],
++                record["phase"],
++                forward_ms,
++                logits_ms,
++                sample_ms,
++                record["lm_head_share_core"],
++            )
++
++        self.lm_head_profile_current = None
++        self.lm_head_profile_active = None
++
+     def _compute_selective_logits_for_grammar(
+         self,
+         scheduler_output: "SchedulerOutput",

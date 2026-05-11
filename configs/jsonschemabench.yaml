@@ -1,0 +1,17 @@
+benchmark: jsonschemabench
+splits:
+  - GlaiveAI-2K
+  - Kubernetes
+  - Github-Easy
+  - Github-Medium
+  - Github-Hard
+smoke_requests_per_split: 100
+main_requests_per_split:
+  GlaiveAI-2K: null
+  Kubernetes: 200
+  Github-Easy: 200
+  Github-Medium: 200
+  Github-Hard: 200
+prompt_template: |
+  Generate one JSON object that satisfies the given JSON Schema. Return only JSON.
+

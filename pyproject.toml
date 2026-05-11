@@ -1,0 +1,70 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "selective-lm-head"
+version = "0.1.0"
+description = "Trace-first selective LM head experiments for constrained decoding."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { text = "MIT" }
+authors = [{ name = "Selective LM Head Project" }]
+dependencies = [
+  "jsonschema>=4.0",
+  "pyyaml>=6.0",
+  "requests>=2.31",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+analysis = [
+  "pandas>=2.0",
+  "matplotlib>=3.8",
+]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.6",
+]
+ml = [
+  "accelerate>=0.34",
+  "datasets>=2.20",
+  "safetensors>=0.4",
+  "sentencepiece>=0.2",
+  "tokenizers>=0.19",
+  "transformers>=4.51",
+  "xgrammar>=0.1.20",
+]
+serve = [
+  "openai>=1.40",
+]
+all = [
+  "accelerate>=0.34",
+  "datasets>=2.20",
+  "matplotlib>=3.8",
+  "openai>=1.40",
+  "pandas>=2.0",
+  "pytest>=8.0",
+  "ruff>=0.6",
+  "safetensors>=0.4",
+  "sentencepiece>=0.2",
+  "tokenizers>=0.19",
+  "transformers>=4.51",
+  "xgrammar>=0.1.20",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["selective_lm_head*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

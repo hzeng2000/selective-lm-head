@@ -1,0 +1,3 @@
+# Install torch separately with the CUDA index in scripts/setup_env.sh, then install this file.
+-e .[ml]
+

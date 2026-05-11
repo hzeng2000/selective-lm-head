@@ -1,0 +1,181 @@
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -4,6 +4,7 @@
+ import functools
+ import gc
+ import itertools
++import os
+ import threading
+ import time
+ from collections import defaultdict
+@@ -356,6 +357,13 @@
+         self.device = device
+         self.pin_memory = is_pin_memory_available()
+         self.dtype = self.model_config.dtype
++        self.selective_lm_head_threshold = int(
++            os.environ.get("VLLM_SELECTIVE_LM_HEAD_THRESHOLD", "0")
++        )
++        self.selective_lm_head_calls = 0
++        self.selective_lm_head_used = 0
++        self.selective_lm_head_fallback_large_k = 0
++        self.selective_lm_head_k_sum = 0
+ 
+         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
+             cache_config.cache_dtype, self.model_config
+@@ -3571,7 +3579,14 @@
+                     )
+ 
+                 sample_hidden_states = hidden_states[logits_indices]
+-                logits = self.model.compute_logits(sample_hidden_states)
++                if (
++                    self.selective_lm_head_threshold > 0
++                    and self.parallel_config.tensor_parallel_size == 1
++                    and not scheduler_output.scheduled_spec_decode_tokens
++                ):
++                    logits = None
++                else:
++                    logits = self.model.compute_logits(sample_hidden_states)
+             else:
+                 # Rare case.
+                 assert not self.is_pooling_model
+@@ -3656,8 +3671,17 @@
+         # Clear ephemeral state.
+         self.execute_model_state = None
+ 
++        selective_logits_used = False
++        if logits is None:
++            logits = self._compute_selective_logits_for_grammar(
++                scheduler_output, sample_hidden_states, grammar_output
++            )
++            selective_logits_used = logits is not None
++            if logits is None:
++                logits = self.model.compute_logits(sample_hidden_states)
++
+         # Apply structured output bitmasks if present.
+-        if grammar_output is not None:
++        if grammar_output is not None and not selective_logits_used:
+             apply_grammar_bitmask(
+                 scheduler_output, grammar_output, self.input_batch, logits
+             )
+@@ -3812,6 +3836,121 @@
+ 
+         return async_output
+ 
++    def _compute_selective_logits_for_grammar(
++        self,
++        scheduler_output: "SchedulerOutput",
++        sample_hidden_states: torch.Tensor,
++        grammar_output: "GrammarOutput | None",
++    ) -> torch.Tensor | None:
++        threshold = self.selective_lm_head_threshold
++        if threshold <= 0 or grammar_output is None:
++            return None
++        if self.parallel_config.tensor_parallel_size != 1:
++            return None
++        if scheduler_output.scheduled_spec_decode_tokens:
++            return None
++        lm_head = getattr(self.model, "lm_head", None)
++        logits_processor = getattr(self.model, "logits_processor", None)
++        weight = getattr(lm_head, "weight", None)
++        if lm_head is None or logits_processor is None or weight is None:
++            return None
++        if getattr(logits_processor, "logits_as_input", False):
++            return None
++        if getattr(lm_head, "quant_config", None) is not None:
++            return None
++
++        grammar_req_ids = grammar_output.structured_output_request_ids
++        grammar_bitmask = grammar_output.grammar_bitmask
++        if not grammar_req_ids or grammar_bitmask is None:
++            return None
++        self.selective_lm_head_calls += 1
++
++        struct_out_req_ids = set(grammar_req_ids)
++        out_indices = [
++            batch_index
++            for batch_index, req_id in enumerate(self.input_batch.req_ids)
++            if req_id in struct_out_req_ids
++        ]
++        if len(out_indices) != sample_hidden_states.shape[0]:
++            return None
++
++        sorted_bitmask = np.full(
++            shape=(sample_hidden_states.shape[0], grammar_bitmask.shape[1]),
++            fill_value=0,
++            dtype=grammar_bitmask.dtype,
++        )
++        for bitmask_index, req_id in enumerate(grammar_req_ids):
++            try:
++                logits_index = self.input_batch.req_ids.index(req_id)
++            except ValueError:
++                return None
++            if logits_index >= sample_hidden_states.shape[0]:
++                return None
++            sorted_bitmask[logits_index] = grammar_bitmask[bitmask_index]
++
++        vocab_size = int(logits_processor.org_vocab_size)
++        if weight.shape[0] < vocab_size:
++            return None
++        logits = torch.full(
++            (sample_hidden_states.shape[0], vocab_size),
++            -float("inf"),
++            device=sample_hidden_states.device,
++            dtype=sample_hidden_states.dtype,
++        )
++        weight = weight[:vocab_size]
++        bias = getattr(lm_head, "bias", None)
++        total_k = 0
++        for logits_idx in range(sample_hidden_states.shape[0]):
++            bits = np.unpackbits(
++                sorted_bitmask[logits_idx].view(np.uint8),
++                bitorder="little",
++            )[:vocab_size]
++            allowed_np = np.flatnonzero(bits)
++            if allowed_np.size == 0 or allowed_np.size > threshold:
++                if allowed_np.size > threshold:
++                    self.selective_lm_head_fallback_large_k += 1
++                    if self.selective_lm_head_fallback_large_k % 100 == 1:
++                        logger.info(
++                            "Selective LM head fallback: K=%d threshold=%d calls=%d used=%d",
++                            allowed_np.size,
++                            threshold,
++                            self.selective_lm_head_calls,
++                            self.selective_lm_head_used,
++                        )
++                return None
++            total_k += int(allowed_np.size)
++            allowed_ids = torch.as_tensor(
++                allowed_np,
++                dtype=torch.long,
++                device=sample_hidden_states.device,
++            )
++            selected_weight = weight.index_select(0, allowed_ids)
++            selected_logits = torch.matmul(
++                sample_hidden_states[logits_idx : logits_idx + 1],
++                selected_weight.t(),
++            ).squeeze(0)
++            if bias is not None:
++                selected_logits = selected_logits + bias.index_select(0, allowed_ids)
++            if logits_processor.soft_cap is not None:
++                selected_logits = selected_logits / logits_processor.soft_cap
++                selected_logits = torch.tanh(selected_logits)
++                selected_logits = selected_logits * logits_processor.soft_cap
++            if logits_processor.scale != 1.0:
++                selected_logits = selected_logits * logits_processor.scale
++            logits[logits_idx].scatter_(0, allowed_ids, selected_logits)
++
++        self.selective_lm_head_used += 1
++        self.selective_lm_head_k_sum += total_k
++        if self.selective_lm_head_used % 100 == 1:
++            logger.info(
++                "Selective LM head used: calls=%d used=%d avg_K=%.2f threshold=%d",
++                self.selective_lm_head_calls,
++                self.selective_lm_head_used,
++                self.selective_lm_head_k_sum / self.selective_lm_head_used,
++                threshold,
++            )
++        return logits
++
+     def _pp_broadcast_prev_sampled_token_ids(
+         self, sampled_token_ids: torch.Tensor
+     ) -> None:

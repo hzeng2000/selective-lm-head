@@ -1,0 +1,14 @@
+benchmark: bfcl
+categories:
+  - simple_python
+  - simple_java
+  - simple_javascript
+  - multiple
+  - parallel
+  - irrelevance
+  - live_simple
+smoke_requests_per_category: 100
+main_requests_per_category: null
+prompt_template: |
+  You are a function calling assistant. Return only the tool call JSON.
+

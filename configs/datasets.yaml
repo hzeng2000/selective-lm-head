@@ -1,0 +1,25 @@
+datasets_root: data/repos
+
+bfcl:
+  repo_url: https://github.com/ShishirPatil/gorilla.git
+  repo_path: data/repos/gorilla
+  data_dir: data/repos/gorilla/berkeley-function-call-leaderboard/bfcl_eval/data
+  categories:
+    simple_python: BFCL_v4_simple_python.json
+    simple_java: BFCL_v4_simple_java.json
+    simple_javascript: BFCL_v4_simple_javascript.json
+    multiple: BFCL_v4_multiple.json
+    parallel: BFCL_v4_parallel.json
+    irrelevance: BFCL_v4_irrelevance.json
+    live_simple: BFCL_v4_live_simple.json
+
+jsonschemabench:
+  repo_url: https://github.com/guidance-ai/jsonschemabench.git
+  repo_path: data/repos/jsonschemabench
+  data_dir: data/repos/jsonschemabench/data
+  splits:
+    GlaiveAI-2K: Glaiveai2K
+    Kubernetes: Kubernetes
+    Github-Easy: Github_easy
+    Github-Medium: Github_medium
+    Github-Hard: Github_hard

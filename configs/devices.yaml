@@ -1,0 +1,16 @@
+devices:
+  a100:
+    device: cuda
+    batch_size: 1
+    timing: cuda_event
+    synchronize: true
+    notes: "A100 single-GPU batch=1 latency runs."
+
+  cpu:
+    device: cpu
+    batch_size: 1
+    timing: perf_counter_ns
+    omp_num_threads: 16
+    mkl_num_threads: 16
+    notes: "Same-host CPU batch=1 latency runs."
+

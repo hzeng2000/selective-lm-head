@@ -491,7 +491,7 @@ peak GPU memory
 ```
 
 推荐运行配置：
-
+模型均已经下载完成，路径为：/hzeng/models
 | 模型 | A100 dtype / quantization | 备注 |
 |---|---|---|
 | Qwen2.5-0.5B | FP16/BF16 | baseline 与 selective 全量运行 |
